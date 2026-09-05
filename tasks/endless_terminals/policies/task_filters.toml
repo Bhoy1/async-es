@@ -1,0 +1,17 @@
+[source]
+repo = "obiwan96/endless-terminals"
+revision = "26ecf78458e7f756e4d06780d5fbf3dd78e91815"
+
+# These tasks require live public HTTP/DNS behavior or perform slow external
+# probes. Keep them in the all-task inventory, but exclude them from stable RL
+# and held-out pools so infrastructure variability cannot determine reward.
+[exclusions]
+task_000000_015c9641 = "requires a live request to https://example.com"
+task_000000_191bc9f5 = "requires live DNS resolution of public hostnames"
+task_000000_23df8ab8 = "runs concurrent public HTTP and ICMP probes"
+task_000000_270ab31c = "requires a live request to postman-echo.com"
+task_000000_4cf3402e = "requires live requests to jsonplaceholder.typicode.com"
+task_000000_5cae14d2 = "requires live requests to jsonplaceholder.typicode.com"
+task_000000_a0490b81 = "requires live requests to jsonplaceholder.typicode.com"
+task_000000_a8f61a57 = "requires a live request to https://example.com"
+task_000000_f6a3b0a9 = "requires live requests to jsonplaceholder.typicode.com"

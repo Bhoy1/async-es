@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.DS_Store
+
+# Generated task assets and model outputs.
+tasks/endless_terminals/data/
+tasks/endless_terminals/runtime/
+external/
+outputs/
+checkpoints/
+wandb/
+*.sif
+*.pt
+*.pth
+*.safetensors
