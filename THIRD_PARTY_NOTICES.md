@@ -2,12 +2,14 @@
 
 ## ES engine utilities
 
-`distributed_utils.py` and `weight_update_utils.py` are derived from code in
-[`es-awd`](https://github.com/kschweig/es-awd), which in turn builds on
-[`es-at-scale`](https://github.com/VsonicV/es-at-scale). Those projects use an
-Academic Public License that permits noncommercial academic, educational, and
-nonprofit research use; commercial use requires a separate license. The
-applicable license text is included in `LICENSE.txt`.
+This project's trainer design builds on
+[`es-at-scale`](https://github.com/VsonicV/es-at-scale). Its low-level
+`distributed_utils.py` and `weight_update_utils.py` implementation also adapts
+code from the independently published
+[`es-awd`](https://github.com/kschweig/es-awd). Both projects use an Academic
+Public License that permits noncommercial academic, educational, and nonprofit
+research use; commercial use requires a separate license. The applicable
+license text is included in `LICENSE.txt`.
 
 The derived files were modified in September 2026 to support bounded-staleness
 asynchronous ES, deterministic update replay, selectable perturbation scopes,

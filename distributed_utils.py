@@ -1,5 +1,6 @@
-# Derived from es-awd and es-at-scale. Modified for bounded-staleness ES,
-# scoped perturbations, modern vLLM, and portable Ray startup (2026-09).
+# Built on es-at-scale; low-level utilities also adapt code from es-awd.
+# Modified for bounded-staleness ES, scoped perturbations, modern vLLM,
+# and portable Ray startup (2026-09).
 import os
 import tempfile
 import torch
