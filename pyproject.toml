@@ -20,7 +20,7 @@ dependencies = [
 ]
 
 [project.scripts]
-async-es-endless = "train:main"
+async-es = "train:main"
 
 [tool.setuptools]
 py-modules = [

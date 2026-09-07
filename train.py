@@ -52,9 +52,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--task_adapter",
-        default=(
-            "tasks.endless_terminals.adapter:EndlessTerminalsAdapter"
-        ),
+        required=True,
         help="Task adapter in package.module:ClassName form",
     )
     parser.add_argument("--model_name", default="Qwen/Qwen2.5-7B-Instruct")
@@ -107,7 +105,7 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--experiment_dir", default="outputs")
     parser.add_argument("--run_name")
-    parser.add_argument("--wandb_project", default="async-es-endless")
+    parser.add_argument("--wandb_project", default="async-es")
     parser.add_argument("--wandb_entity")
     parser.add_argument(
         "--wandb_mode",
@@ -369,14 +367,6 @@ def evaluate(
         "token_entropy": metrics["avg_token_entropy"],
         "elapsed_seconds": elapsed,
     }
-    eval_aliases = {
-        "avg_turns": "turns",
-        "avg_commands": "commands",
-        "avg_invalid_actions": "invalid_actions",
-    }
-    for metric_name, alias in eval_aliases.items():
-        if metric_name in result.metrics:
-            payload[alias] = result.metrics[metric_name]
     write_json(
         run_dir / "evaluations" / f"step_{version:06d}.json", payload
     )
@@ -825,22 +815,6 @@ def run_async_es(
                     ]
                 )
             )
-        legacy_train_aliases = {
-            "avg_turns": "train/turns",
-            "timeout_rate": "train/timeout_rate",
-        }
-        for metric_name, alias in legacy_train_aliases.items():
-            if metric_name in task_metric_names:
-                train_payload[alias] = float(
-                    np.mean(
-                        [
-                            item["evaluation"].metrics.get(
-                                metric_name, 0.0
-                            )
-                            for item in records
-                        ]
-                    )
-                )
         if args.track_token_entropy:
             token_count = sum(
                 item["metrics"]["token_entropy_count"] for item in records
