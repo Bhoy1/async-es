@@ -1,42 +1,22 @@
-"""Endless Terminals adapter for the generic asynchronous ES trainer."""
+"""Endless Terminals implementation of the reusable multi-turn adapter."""
 
 from __future__ import annotations
 
 from argparse import ArgumentParser, Namespace
 from typing import Any
 
-from task_adapter import BatchEvaluation, GenerateFn, SamplingConfig
 from tasks.endless_terminals.data import get_data
-from tasks.endless_terminals.rollout import run_endless_rollouts
-from token_entropy_utils import summarize_token_entropy
+from tasks.endless_terminals.rollout import (
+    LocalEndlessSessionBackend,
+    load_official_environment,
+)
+from tasks.multi_turn import MultiTurnAdapter, SessionBackend, TrajectoryState
 
 
-def _reward_for_output(output: Any) -> tuple[float, dict[str, Any]]:
-    reward = getattr(output, "precomputed_reward", None)
-    if reward is None:
-        raise RuntimeError("Endless rollout did not return a sandbox reward")
-    return float(reward["reward"]), dict(reward.get("reward_info") or {})
-
-
-def _output_token_count(output: Any) -> int:
-    if not getattr(output, "outputs", None):
-        return 0
-    return len(getattr(output.outputs[0], "token_ids", None) or [])
-
-
-def _output_finish_reason(output: Any) -> str:
-    if not getattr(output, "outputs", None):
-        return "missing_output"
-    return str(getattr(output.outputs[0], "finish_reason", None) or "unknown")
-
-
-class EndlessTerminalsAdapter:
-    """Stateful multi-turn task adapter backed by the official environment."""
+class EndlessTerminalsAdapter(MultiTurnAdapter):
+    """Stateful terminal task backed by the official Endless environment."""
 
     name = "endless_terminals"
-
-    def __init__(self, args: Namespace):
-        self.args = args
 
     @classmethod
     def add_arguments(cls, parser: ArgumentParser) -> None:
@@ -78,103 +58,90 @@ class EndlessTerminalsAdapter:
             if getattr(args, name) < 1:
                 parser.error(f"--{name} must be positive")
 
+    @property
+    def max_turns(self) -> int:
+        return self.args.endless_max_turns
+
+    @property
+    def max_input_tokens(self) -> int:
+        return self.args.endless_max_input_tokens
+
+    @property
+    def session_pool_size(self) -> int:
+        return self.args.endless_env_batch_size
+
+    @property
+    def rollout_scheduler(self) -> str:
+        return self.args.endless_rollout_scheduler
+
+    @property
+    def scheduler_debug(self) -> bool:
+        return self.args.endless_scheduler_debug
+
     def load_data(self, tokenizer: Any) -> tuple[list[Any], list[Any]]:
         return get_data(
-            tokenizer,
             train_data_path=self.args.endless_train_data_path,
             eval_data_path=self.args.endless_eval_data_path,
-            max_input_tokens=self.args.endless_max_input_tokens,
         )
 
-    def evaluate_batch(
-        self,
-        rows: list[Any],
-        *,
-        tokenizer: Any,
-        generate: GenerateFn,
-        generation_seed: int,
-        sampling: SamplingConfig,
-        iteration: int,
-        perturbation_seed: int,
-        trajectory_sample_size: int,
-    ) -> BatchEvaluation:
-        def generate_turn(prompts, turn_seed):
-            return generate(prompts, turn_seed, sampling)
-
-        outputs = run_endless_rollouts(
-            rows,
-            tokenizer=tokenizer,
-            generate_fn=generate_turn,
-            official_repo=self.args.endless_official_repo,
-            seed=generation_seed,
-            max_turns=self.args.endless_max_turns,
+    def create_session_backend(self) -> SessionBackend:
+        environment_class = load_official_environment(
+            self.args.endless_official_repo
+        )
+        return LocalEndlessSessionBackend(
+            environment_class,
+            max_turns=self.max_turns,
             max_time=self.args.endless_max_time,
-            max_input_tokens=self.args.endless_max_input_tokens,
-            max_tokens_per_turn=sampling.max_tokens,
             max_output_length=self.args.endless_max_output_chars,
-            env_batch_size=self.args.endless_env_batch_size,
-            env_workers=self.args.endless_env_workers,
-            scheduler=self.args.endless_rollout_scheduler,
-            scheduler_debug=self.args.endless_scheduler_debug,
+            workers=self.args.endless_env_workers,
             verbose=self.args.verbose,
         )
 
-        rewards: list[float] = []
-        turns: list[float] = []
-        commands: list[float] = []
-        invalid: list[float] = []
-        timed_out: list[float] = []
-        generated_tokens: list[float] = []
-        finish_reasons: dict[str, int] = {}
-        trajectories: list[dict[str, Any]] = []
-        for index, (output, row) in enumerate(zip(outputs, rows)):
-            reward, info = _reward_for_output(output)
-            rewards.append(reward)
-            turns.append(float(info.get("turns", 0.0)))
-            commands.append(float(info.get("command_actions", 0.0)))
-            invalid.append(float(info.get("invalid_actions", 0.0)))
-            timed_out.append(float(info.get("timed_out", 0.0)))
-            generated_tokens.append(float(_output_token_count(output)))
-            reason = _output_finish_reason(output)
-            finish_reasons[reason] = finish_reasons.get(reason, 0) + 1
-            if len(trajectories) < trajectory_sample_size:
-                trajectories.append(
-                    {
-                        "iteration": iteration,
-                        "perturbation_seed": perturbation_seed,
-                        "sample_index": index,
-                        "task_id": row.get("id"),
-                        "reward": reward,
-                        "reward_info": info,
-                        "interactive_trajectory": getattr(
-                            output, "trajectory", None
-                        ),
-                    }
-                )
+    def initial_messages(self, row: Any) -> list[dict[str, Any]]:
+        return [dict(message) for message in row["prompt_messages"]]
 
-        entropy = summarize_token_entropy(
-            outputs, require=sampling.track_token_entropy
-        )
-        return BatchEvaluation(
-            rewards=rewards,
-            metrics={
-                "avg_turns": _mean(turns),
-                "avg_commands": _mean(commands),
-                "avg_invalid_actions": _mean(invalid),
-                "timeout_rate": _mean(timed_out),
-                "avg_output_tokens": _mean(generated_tokens),
+    def terminal_response(self) -> str:
+        return "<action>done</action>"
+
+    def task_metrics(
+        self,
+        session: Any,
+        state: TrajectoryState,
+    ) -> dict[str, float]:
+        return {
+            "avg_commands": float(session.commands),
+            "avg_invalid_actions": float(session.invalid_actions),
+            "timeout_rate": float(state.timed_out),
+        }
+
+    def trajectory_record(
+        self,
+        session: Any,
+        state: TrajectoryState,
+    ) -> dict[str, Any]:
+        reward_info = {
+            "task": self.name,
+            "scalar_reward": state.reward,
+            "success": state.reward,
+            "turns": float(state.turns),
+            "command_actions": float(session.commands),
+            "invalid_actions": float(session.invalid_actions),
+            "timed_out": float(state.timed_out),
+            "generation_seconds": state.generation_seconds,
+            "sandbox_step_seconds": float(session.sandbox_step_seconds),
+            "max_token_hits": float(state.max_token_hits),
+        }
+        return {
+            "reward_info": reward_info,
+            "interactive_trajectory": {
+                "task_id": self.task_id(state.row, 0),
+                "messages": state.messages,
+                "grader_output": state.final_info.get("grader_output", ""),
+                **reward_info,
             },
-            trajectories=trajectories,
-            finish_reasons=finish_reasons,
-            token_entropy_sum=float(entropy["token_entropy_sum"]),
-            token_entropy_count=int(entropy["token_entropy_count"]),
-            response_entropy_sum=float(entropy["response_entropy_sum"]),
-            response_entropy_square_sum=float(
-                entropy["response_entropy_square_sum"]
-            ),
-            response_entropy_count=int(entropy["response_entropy_count"]),
-        )
+        }
 
-
-def _mean(values: list[float]) -> float:
-    return sum(values) / len(values) if values else 0.0
+    def completion_finish_reason(self, state: TrajectoryState) -> str:
+        if state.timed_out:
+            return "endless_timeout"
+        return "endless_success" if state.reward > 0.0 else "endless_failure"

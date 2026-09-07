@@ -1,35 +1,50 @@
-"""Reusable adapter for ordinary prompt-response tasks.
-
-A benchmark supplies three callables: a data loader, a prompt formatter, and a
-reward function. This keeps benchmark code out of the ES scheduler while still
-supporting arbitrary scalar rewards and task-specific metrics.
-"""
+"""Reusable adapter base for ordinary prompt-response tasks."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Callable
+from abc import ABC, abstractmethod
+from argparse import ArgumentParser, Namespace
+from typing import Any
 
 from task_adapter import BatchEvaluation, GenerateFn, SamplingConfig
 from token_entropy_utils import summarize_token_entropy
 
 
-DataLoader = Callable[[Any], tuple[list[Any], list[Any]]]
-PromptFormatter = Callable[[Any, Any], Any]
-RewardFunction = Callable[[str, Any], float | tuple[float, dict[str, float]]]
+class SingleTurnAdapter(ABC):
+    """Base adapter implementing the common one-generation task flow."""
 
+    name = "single_turn"
 
-@dataclass
-class SingleTurnAdapter:
-    """Functional adapter for stateless, single-response benchmarks."""
+    def __init__(self, args: Namespace):
+        self.args = args
 
-    load_data_fn: DataLoader
-    format_prompt: PromptFormatter
-    score_response: RewardFunction
-    name: str = "single_turn"
+    @classmethod
+    def add_arguments(cls, parser: ArgumentParser) -> None:
+        """Add task-specific arguments in a concrete subclass."""
 
+    @classmethod
+    def from_args(cls, args: Namespace) -> "SingleTurnAdapter":
+        return cls(args)
+
+    @classmethod
+    def validate_args(
+        cls, args: Namespace, parser: ArgumentParser
+    ) -> None:
+        """Validate task-specific arguments in a concrete subclass."""
+
+    @abstractmethod
     def load_data(self, tokenizer: Any) -> tuple[list[Any], list[Any]]:
-        return self.load_data_fn(tokenizer)
+        """Return training and evaluation rows."""
+
+    @abstractmethod
+    def format_prompt(self, row: Any, tokenizer: Any) -> Any:
+        """Convert one task row into a vLLM-compatible prompt."""
+
+    @abstractmethod
+    def score_response(
+        self, response: str, row: Any
+    ) -> float | tuple[float, dict[str, float]]:
+        """Score one generated response and optionally return metrics."""
 
     def evaluate_batch(
         self,
