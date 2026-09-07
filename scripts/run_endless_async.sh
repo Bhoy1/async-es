@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 : "${MODEL_NAME:=Qwen/Qwen2.5-7B-Instruct}"
+: "${TASK_ADAPTER:=tasks.endless_terminals.adapter:EndlessTerminalsAdapter}"
 : "${NUM_ENGINES:=4}"
 : "${CUDA_DEVICES:=0,1,2,3}"
 : "${POPULATION_SIZE:=30}"
@@ -42,6 +43,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 : "${ENDLESS_EVAL_DATA_PATH:?Set ENDLESS_EVAL_DATA_PATH to validation.parquet}"
 
 COMMAND=(python "${ROOT}/train.py" \
+  --task_adapter "${TASK_ADAPTER}" \
   --model_name "${MODEL_NAME}" \
   --max_policy_staleness "${MAX_POLICY_STALENESS}" \
   --num_engines "${NUM_ENGINES}" \

@@ -1,3 +1,5 @@
+# Derived from es-awd and es-at-scale. Modified for perturbation scopes,
+# seeded replay, and additional update controls (2026-09).
 from collections.abc import Iterable
 from itertools import zip_longest
 

@@ -1,7 +1,6 @@
-"""Natural bounded-staleness ES for Endless Terminals.
+"""Natural bounded-staleness ES for stateful and single-turn LLM tasks.
 
-This focused trainer contains the real vLLM/Ray execution path used by the
-Endless experiments, without unrelated tasks or controlled-lag experiments.
+Task-specific data, rollout, and reward behavior is supplied by an adapter.
 """
 
 from __future__ import annotations
@@ -26,14 +25,37 @@ import wandb
 
 from async_es_coordinator import BoundedStalenessCoordinator
 from distributed_utils import cleanup, launch_engines
-from tasks.endless_terminals.data import get_data
-from tasks.endless_terminals.rollout import run_endless_rollouts
-from token_entropy_utils import summarize_token_entropy
+from task_adapter import (
+    BatchEvaluation,
+    SamplingConfig,
+    TaskAdapter,
+    load_task_adapter_class,
+)
 
 
 def parse_args() -> argparse.Namespace:
+    adapter_parser = argparse.ArgumentParser(add_help=False)
+    adapter_parser.add_argument(
+        "--task_adapter",
+        default=(
+            "tasks.endless_terminals.adapter:EndlessTerminalsAdapter"
+        ),
+    )
+    preliminary, _ = adapter_parser.parse_known_args()
+    try:
+        adapter_class = load_task_adapter_class(preliminary.task_adapter)
+    except (ImportError, AttributeError, TypeError, ValueError) as exc:
+        adapter_parser.error(str(exc))
+
     parser = argparse.ArgumentParser(
-        description="Natural bounded-staleness ES on Endless Terminals"
+        description="Natural bounded-staleness ES for LLM tasks"
+    )
+    parser.add_argument(
+        "--task_adapter",
+        default=(
+            "tasks.endless_terminals.adapter:EndlessTerminalsAdapter"
+        ),
+        help="Task adapter in package.module:ClassName form",
     )
     parser.add_argument("--model_name", default="Qwen/Qwen2.5-7B-Instruct")
     parser.add_argument("--num_engines", type=int, default=4)
@@ -66,23 +88,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval_top_k", type=int, default=-1)
     parser.add_argument("--max_tokens", type=int, default=2_048)
 
-    parser.add_argument("--endless_official_repo", required=True)
-    parser.add_argument("--endless_train_data_path", required=True)
-    parser.add_argument("--endless_eval_data_path", required=True)
-    parser.add_argument("--endless_max_turns", type=int, default=16)
-    parser.add_argument("--endless_max_time", type=float, default=300.0)
-    parser.add_argument("--endless_max_input_tokens", type=int, default=16_384)
-    parser.add_argument("--endless_max_output_chars", type=int, default=50_000)
-    parser.add_argument("--endless_env_batch_size", type=int, default=32)
-    parser.add_argument("--endless_env_workers", type=int, default=32)
-    parser.add_argument(
-        "--endless_rollout_scheduler",
-        choices=["fixed", "continuous"],
-        default="continuous",
-    )
-    parser.add_argument("--endless_scheduler_debug", action="store_true")
-    parser.add_argument("--verbose", action="store_true")
-
     parser.add_argument("--eval_interval", type=int, default=10)
     parser.add_argument("--eval_max_samples", type=int, default=100)
     parser.add_argument("--eval_batch_size", type=int, default=100)
@@ -110,6 +115,7 @@ def parse_args() -> argparse.Namespace:
         default="online",
     )
 
+    adapter_class.add_arguments(parser)
     args = parser.parse_args()
     os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda_devices
     try:
@@ -130,9 +136,6 @@ def parse_args() -> argparse.Namespace:
         "train_batch_size": args.train_batch_size,
         "max_tokens": args.max_tokens,
         "max_model_len": args.max_model_len,
-        "endless_max_turns": args.endless_max_turns,
-        "endless_env_batch_size": args.endless_env_batch_size,
-        "endless_env_workers": args.endless_env_workers,
     }
     for name, value in positive.items():
         if value < 1:
@@ -154,6 +157,7 @@ def parse_args() -> argparse.Namespace:
         parser.error("--start_iteration must be smaller than --num_iterations")
     if args.eval_only and args.skip_initial_eval:
         parser.error("--eval_only cannot be combined with --skip_initial_eval")
+    adapter_class.validate_args(args, parser)
     return args
 
 
@@ -193,128 +197,58 @@ def generate_rollouts(
     return engine.generate.remote(prompts, sampling, use_tqdm=False)
 
 
-def generate_endless_outputs(
+def evaluate_task_batch(
+    adapter: TaskAdapter,
     engine,
-    task_data: list[dict[str, Any]],
+    rows,
     tokenizer,
     *,
-    seed: int,
-    temperature: float,
-    top_p: float,
-    top_k: int,
-    args: argparse.Namespace,
-):
-    def generate_fn(prompts, turn_seed):
+    generation_seed: int,
+    sampling: SamplingConfig,
+    iteration: int,
+    perturbation_seed: int,
+    trajectory_sample_size: int,
+) -> BatchEvaluation:
+    def generate(prompts, seed, config):
         return ray.get(
             generate_rollouts(
                 engine,
                 prompts,
-                seed=turn_seed,
-                max_tokens=args.max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-                track_token_entropy=args.track_token_entropy,
+                seed=seed,
+                max_tokens=config.max_tokens,
+                temperature=config.temperature,
+                top_p=config.top_p,
+                top_k=config.top_k,
+                track_token_entropy=config.track_token_entropy,
             )
         )
 
-    return run_endless_rollouts(
-        task_data,
+    return adapter.evaluate_batch(
+        rows,
         tokenizer=tokenizer,
-        generate_fn=generate_fn,
-        official_repo=args.endless_official_repo,
-        seed=seed,
-        max_turns=args.endless_max_turns,
-        max_time=args.endless_max_time,
-        max_input_tokens=args.endless_max_input_tokens,
-        max_tokens_per_turn=args.max_tokens,
-        max_output_length=args.endless_max_output_chars,
-        env_batch_size=args.endless_env_batch_size,
-        env_workers=args.endless_env_workers,
-        scheduler=args.endless_rollout_scheduler,
-        scheduler_debug=args.endless_scheduler_debug,
-        verbose=args.verbose,
+        generate=generate,
+        generation_seed=generation_seed,
+        sampling=sampling,
+        iteration=iteration,
+        perturbation_seed=perturbation_seed,
+        trajectory_sample_size=trajectory_sample_size,
     )
 
 
-def reward_for_output(output: Any) -> tuple[float, dict[str, Any]]:
-    reward = getattr(output, "precomputed_reward", None)
-    if reward is None:
-        raise RuntimeError("Endless rollout did not return a sandbox reward")
-    return float(reward["reward"]), dict(reward.get("reward_info") or {})
+def sampling_config(
+    args: argparse.Namespace, *, evaluation: bool
+) -> SamplingConfig:
+    prefix = "eval" if evaluation else "train"
+    return SamplingConfig(
+        max_tokens=args.max_tokens,
+        temperature=getattr(args, f"{prefix}_temperature"),
+        top_p=getattr(args, f"{prefix}_top_p"),
+        top_k=getattr(args, f"{prefix}_top_k"),
+        track_token_entropy=args.track_token_entropy,
+    )
 
 
-def output_token_count(output: Any) -> int:
-    if not getattr(output, "outputs", None):
-        return 0
-    return len(getattr(output.outputs[0], "token_ids", None) or [])
-
-
-def output_finish_reason(output: Any) -> str:
-    if not getattr(output, "outputs", None):
-        return "missing_output"
-    return str(getattr(output.outputs[0], "finish_reason", None) or "unknown")
-
-
-def summarize_outputs(
-    outputs,
-    task_data,
-    *,
-    iteration: int,
-    perturbation_seed: int,
-    trajectory_sample_size: int,
-    require_entropy: bool,
-) -> dict[str, Any]:
-    rewards: list[float] = []
-    turns: list[float] = []
-    commands: list[float] = []
-    invalid: list[float] = []
-    timed_out: list[float] = []
-    generated_tokens: list[int] = []
-    finish_reasons: dict[str, int] = {}
-    trajectories = []
-    for index, (output, row) in enumerate(zip(outputs, task_data)):
-        reward, info = reward_for_output(output)
-        rewards.append(reward)
-        turns.append(float(info.get("turns", 0.0)))
-        commands.append(float(info.get("command_actions", 0.0)))
-        invalid.append(float(info.get("invalid_actions", 0.0)))
-        timed_out.append(float(info.get("timed_out", 0.0)))
-        generated_tokens.append(output_token_count(output))
-        reason = output_finish_reason(output)
-        finish_reasons[reason] = finish_reasons.get(reason, 0) + 1
-        if len(trajectories) < trajectory_sample_size:
-            trajectories.append(
-                {
-                    "iteration": iteration,
-                    "perturbation_seed": perturbation_seed,
-                    "sample_index": index,
-                    "task_id": row.get("id"),
-                    "reward": reward,
-                    "reward_info": info,
-                    "interactive_trajectory": getattr(output, "trajectory", None),
-                }
-            )
-    entropy = summarize_token_entropy(outputs, require=require_entropy)
-    return {
-        "avg_reward": float(np.mean(rewards)) if rewards else 0.0,
-        "std_task_reward": float(np.std(rewards)) if rewards else 0.0,
-        "successes": int(sum(reward > 0.0 for reward in rewards)),
-        "task_count": len(rewards),
-        "avg_turns": float(np.mean(turns)) if turns else 0.0,
-        "avg_commands": float(np.mean(commands)) if commands else 0.0,
-        "avg_invalid_actions": float(np.mean(invalid)) if invalid else 0.0,
-        "timeout_rate": float(np.mean(timed_out)) if timed_out else 0.0,
-        "avg_output_tokens": (
-            float(np.mean(generated_tokens)) if generated_tokens else 0.0
-        ),
-        "finish_reasons": finish_reasons,
-        "trajectory_samples": trajectories,
-        **entropy,
-    }
-
-
-def select_train_batch(data: list[dict[str, Any]], batch_size: int, seed: int):
+def select_train_batch(data: list[Any], batch_size: int, seed: int):
     if batch_size >= len(data):
         return data
     indices = np.random.default_rng(seed).choice(
@@ -391,6 +325,7 @@ def evaluate(
     engine,
     eval_data,
     tokenizer,
+    adapter: TaskAdapter,
     *,
     version: int,
     run,
@@ -403,49 +338,52 @@ def evaluate(
         else eval_data
     )
     started = time.time()
-    outputs = []
+    batches: list[BatchEvaluation] = []
+    trajectory_samples_remaining = (
+        len(data) if args.eval_trajectory_path else 0
+    )
     for offset in range(0, len(data), args.eval_batch_size):
         batch = data[offset : offset + args.eval_batch_size]
-        outputs.extend(
-            generate_endless_outputs(
-                engine,
-                batch,
-                tokenizer,
-                seed=args.global_seed + 100_000 + offset,
-                temperature=args.eval_temperature,
-                top_p=args.eval_top_p,
-                top_k=args.eval_top_k,
-                args=args,
-            )
+        result = evaluate_task_batch(
+            adapter,
+            engine,
+            batch,
+            tokenizer,
+            generation_seed=args.global_seed + 100_000 + offset,
+            sampling=sampling_config(args, evaluation=True),
+            iteration=version,
+            perturbation_seed=0,
+            trajectory_sample_size=trajectory_samples_remaining,
         )
-    metrics = summarize_outputs(
-        outputs,
-        data,
-        iteration=version,
-        perturbation_seed=0,
-        trajectory_sample_size=len(data) if args.eval_trajectory_path else 0,
-        require_entropy=args.track_token_entropy,
-    )
+        batches.append(result)
+        trajectory_samples_remaining -= len(result.trajectories)
+    result = BatchEvaluation.combine(batches)
+    metrics = result.to_dict()
     elapsed = time.time() - started
     payload = {
         "version": version,
         "reward": metrics["avg_reward"],
         "successes": metrics["successes"],
         "tasks": metrics["task_count"],
-        "turns": metrics["avg_turns"],
-        "commands": metrics["avg_commands"],
-        "invalid_actions": metrics["avg_invalid_actions"],
-        "timeout_rate": metrics["timeout_rate"],
+        **result.metrics,
         "token_entropy": metrics["avg_token_entropy"],
         "elapsed_seconds": elapsed,
     }
+    eval_aliases = {
+        "avg_turns": "turns",
+        "avg_commands": "commands",
+        "avg_invalid_actions": "invalid_actions",
+    }
+    for metric_name, alias in eval_aliases.items():
+        if metric_name in result.metrics:
+            payload[alias] = result.metrics[metric_name]
     write_json(
         run_dir / "evaluations" / f"step_{version:06d}.json", payload
     )
     if args.eval_trajectory_path:
         write_jsonl(
             Path(args.eval_trajectory_path.format(step=version)),
-            metrics["trajectory_samples"],
+            result.trajectories,
         )
     run.log(
         {
@@ -458,8 +396,7 @@ def evaluate(
     print(
         f"[Eval step {version}] {metrics['successes']}/"
         f"{metrics['task_count']} reward={metrics['avg_reward']:.4f} "
-        f"turns={metrics['avg_turns']:.2f} "
-        f"timeouts={metrics['timeout_rate']:.3f} "
+        f"task_metrics={result.metrics} "
         f"entropy={metrics['avg_token_entropy']:.4f} time={elapsed:.1f}s",
         flush=True,
     )
@@ -470,6 +407,7 @@ def probe_center_entropy(
     engines,
     task_data,
     tokenizer,
+    adapter: TaskAdapter,
     *,
     version: int,
     args: argparse.Namespace,
@@ -480,23 +418,28 @@ def probe_center_entropy(
     with ThreadPoolExecutor(max_workers=len(engines)) as executor:
         futures = [
             executor.submit(
-                generate_endless_outputs,
+                evaluate_task_batch,
+                adapter,
                 engine,
                 shard,
                 tokenizer,
-                seed=args.global_seed + 200_000 + version + index,
-                temperature=args.train_temperature,
-                top_p=args.train_top_p,
-                top_k=args.train_top_k,
-                args=args,
+                generation_seed=args.global_seed + 200_000 + version + index,
+                sampling=sampling_config(args, evaluation=False),
+                iteration=version,
+                perturbation_seed=0,
+                trajectory_sample_size=0,
             )
             for index, (engine, shard) in enumerate(zip(engines, shards))
             if shard
         ]
-        outputs = [
-            output for future in futures for output in future.result()
-        ]
-    return summarize_token_entropy(outputs, require=True)
+        batches = [future.result() for future in futures]
+    result = BatchEvaluation.combine(batches)
+    if result.token_entropy_count == 0:
+        raise RuntimeError(
+            "Token entropy tracking was requested, but the task adapter "
+            "returned no entropy values."
+        )
+    return result.to_dict()
 
 
 def run_async_es(
@@ -506,6 +449,7 @@ def run_async_es(
     train_data,
     eval_data,
     tokenizer,
+    adapter: TaskAdapter,
     run,
     run_dir: Path,
     scope_stats: dict[str, Any],
@@ -518,7 +462,7 @@ def run_async_es(
     updates: list[dict[str, Any]] = []
     engine_versions = [args.start_iteration] * len(engines)
     dispatch_counts: dict[int, int] = {}
-    train_batches: dict[int, list[dict[str, Any]]] = {}
+    train_batches: dict[int, list[Any]] = {}
     in_flight: dict[Any, int] = {}
     job_counter = 0
     completed_total = 0
@@ -570,19 +514,24 @@ def run_async_es(
         rollout_error = None
         rollout_started = time.time()
         try:
-            outputs = generate_endless_outputs(
+            evaluation = evaluate_task_batch(
+                adapter,
                 engines[engine_index],
                 job["task_data"],
                 tokenizer,
-                seed=job["generation_seed"],
-                temperature=args.train_temperature,
-                top_p=args.train_top_p,
-                top_k=args.train_top_k,
-                args=args,
+                generation_seed=job["generation_seed"],
+                sampling=sampling_config(args, evaluation=False),
+                iteration=job["dispatch_version"] + 1,
+                perturbation_seed=job["seed"],
+                trajectory_sample_size=(
+                    args.trajectory_sample_size
+                    if args.trajectory_interval > 0
+                    else 0
+                ),
             )
         except Exception as exc:
             rollout_error = exc
-            outputs = None
+            evaluation = None
         finally:
             rollout_seconds = time.time() - rollout_started
             point = time.time()
@@ -604,7 +553,7 @@ def run_async_es(
         return {
             **job,
             "engine_index": engine_index,
-            "outputs": outputs,
+            "evaluation": evaluation,
             "catchup_seconds": catchup_seconds,
             "perturb_seconds": perturb_seconds,
             "rollout_seconds": rollout_seconds,
@@ -708,6 +657,7 @@ def run_async_es(
                 engines,
                 batch_for(max(0, version - 1)),
                 tokenizer,
+                adapter,
                 version=version,
                 args=args,
             )
@@ -733,6 +683,7 @@ def run_async_es(
                 engines[0],
                 eval_data,
                 tokenizer,
+                adapter,
                 version=version,
                 run=run,
                 run_dir=run_dir,
@@ -755,18 +706,7 @@ def run_async_es(
         nonlocal discarded_rollout_seconds
         nonlocal previous_update_time
         completed_total += 1
-        metrics = summarize_outputs(
-            record["outputs"],
-            record["task_data"],
-            iteration=coordinator.current_version + 1,
-            perturbation_seed=record["seed"],
-            trajectory_sample_size=(
-                args.trajectory_sample_size
-                if args.trajectory_interval > 0
-                else 0
-            ),
-            require_entropy=args.track_token_entropy,
-        )
+        metrics = record["evaluation"].to_dict()
         record["metrics"] = metrics
         decision = coordinator.observe(
             record, dispatch_version=record["dispatch_version"]
@@ -840,7 +780,7 @@ def run_async_es(
             trajectories = [
                 sample
                 for item in records
-                for sample in item["metrics"]["trajectory_samples"]
+                for sample in item["evaluation"].trajectories
             ]
             write_jsonl(
                 run_dir
@@ -856,16 +796,6 @@ def run_async_es(
             "train/std_reward": std_reward,
             "train/min_reward": float(rewards.min()),
             "train/max_reward": float(rewards.max()),
-            "train/turns": float(
-                np.mean(
-                    [item["metrics"]["avg_turns"] for item in records]
-                )
-            ),
-            "train/timeout_rate": float(
-                np.mean(
-                    [item["metrics"]["timeout_rate"] for item in records]
-                )
-            ),
             "async/current_policy_version": version,
             "async/accepted_staleness_mean": float(np.mean(stalenesses)),
             "async/accepted_staleness_max": int(max(stalenesses)),
@@ -883,6 +813,34 @@ def run_async_es(
                 coordinator.accepted_total + coordinator.discarded_total,
             ),
         }
+        task_metric_names = set().union(
+            *(item["evaluation"].metrics for item in records)
+        )
+        for metric_name in task_metric_names:
+            train_payload[f"train/task/{metric_name}"] = float(
+                np.mean(
+                    [
+                        item["evaluation"].metrics.get(metric_name, 0.0)
+                        for item in records
+                    ]
+                )
+            )
+        legacy_train_aliases = {
+            "avg_turns": "train/turns",
+            "timeout_rate": "train/timeout_rate",
+        }
+        for metric_name, alias in legacy_train_aliases.items():
+            if metric_name in task_metric_names:
+                train_payload[alias] = float(
+                    np.mean(
+                        [
+                            item["evaluation"].metrics.get(
+                                metric_name, 0.0
+                            )
+                            for item in records
+                        ]
+                    )
+                )
         if args.track_token_entropy:
             token_count = sum(
                 item["metrics"]["token_entropy_count"] for item in records
@@ -996,6 +954,8 @@ def run_async_es(
 
 def main() -> None:
     args = parse_args()
+    adapter_class = load_task_adapter_class(args.task_adapter)
+    adapter = adapter_class.from_args(args)
     seed_everything(args.global_seed)
     if args.track_token_entropy:
         marker = os.environ.get(
@@ -1010,7 +970,7 @@ def main() -> None:
         os.environ["VLLM_ES_TOKEN_ENTROPY"] = "1"
 
     name = args.run_name or (
-        f"{args.model_name.split('/')[-1]}_endless_async_"
+        f"{args.model_name.split('/')[-1]}_{adapter.name}_async_"
         f"{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     )
     run_dir = Path(args.experiment_dir) / name
@@ -1028,12 +988,7 @@ def main() -> None:
     pgs = []
     try:
         tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-        train_data, eval_data = get_data(
-            tokenizer,
-            train_data_path=args.endless_train_data_path,
-            eval_data_path=args.endless_eval_data_path,
-            max_input_tokens=args.endless_max_input_tokens,
-        )
+        train_data, eval_data = adapter.load_data(tokenizer)
         print(
             f"Loaded train={len(train_data)}, eval={len(eval_data)}",
             flush=True,
@@ -1080,6 +1035,7 @@ def main() -> None:
                 engines[0],
                 eval_data,
                 tokenizer,
+                adapter,
                 version=args.start_iteration,
                 run=run,
                 run_dir=run_dir,
@@ -1092,6 +1048,7 @@ def main() -> None:
                 train_data=train_data,
                 eval_data=eval_data,
                 tokenizer=tokenizer,
+                adapter=adapter,
                 run=run,
                 run_dir=run_dir,
                 scope_stats=scope_stats,

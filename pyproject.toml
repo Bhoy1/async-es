@@ -27,6 +27,7 @@ py-modules = [
   "train",
   "async_es_coordinator",
   "distributed_utils",
+  "task_adapter",
   "token_entropy_utils",
   "weight_update_utils",
 ]

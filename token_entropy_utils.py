@@ -26,7 +26,11 @@ def output_token_entropies(output: Any) -> list[float]:
     for token_entry in token_entries:
         if token_entry is None:
             continue
-        values = list(token_entry.values() if isinstance(token_entry, dict) else token_entry)
+        values = list(
+            token_entry.values()
+            if isinstance(token_entry, dict)
+            else token_entry
+        )
         if len(values) != 1:
             raise RuntimeError(
                 "Entropy-enabled vLLM must return exactly one scalar per token; "
@@ -70,6 +74,11 @@ def summarize_token_entropy(
         "token_entropy_sum": entropy_sum,
         "token_entropy_count": token_count,
         "avg_token_entropy": entropy_sum / token_count if token_count else 0.0,
+        "response_entropy_sum": math.fsum(response_means),
+        "response_entropy_square_sum": math.fsum(
+            value * value for value in response_means
+        ),
+        "response_entropy_count": len(response_means),
         "avg_response_entropy": (
             statistics.fmean(response_means) if response_means else 0.0
         ),
