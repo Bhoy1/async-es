@@ -41,6 +41,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 : "${RESUME_CHECKPOINT:=}"
 : "${START_ITERATION:=0}"
 : "${SKIP_INITIAL_EVAL:=0}"
+: "${EVAL_ONLY:=0}"
 
 : "${ENDLESS_OFFICIAL_REPO:?Set ENDLESS_OFFICIAL_REPO to the pinned Endless Terminals checkout}"
 : "${ENDLESS_TRAIN_DATA_PATH:?Set ENDLESS_TRAIN_DATA_PATH to train.parquet}"
@@ -115,6 +116,9 @@ if [[ -n "${RESUME_CHECKPOINT}" ]]; then
 fi
 if [[ "${SKIP_INITIAL_EVAL}" == "1" ]]; then
   COMMAND+=(--skip_initial_eval)
+fi
+if [[ "${EVAL_ONLY}" == "1" ]]; then
+  COMMAND+=(--eval_only)
 fi
 
 exec "${COMMAND[@]}"
