@@ -11,8 +11,12 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 : "${TRAIN_BATCH_SIZE:=256}"
 : "${NUM_ITERATIONS:=100}"
 : "${MAX_POLICY_STALENESS:=1}"
-: "${SIGMA:=0.0015}"
-: "${ALPHA:=0.00075}"
+: "${PARAMETERIZATION:=full}"
+: "${SIGMA:=}"
+: "${ALPHA:=}"
+: "${LORA_R:=32}"
+: "${LORA_ALPHA:=64}"
+: "${LORA_TARGET_MODULES:=q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj}"
 : "${MAX_TOKENS:=2048}"
 : "${MAX_MODEL_LEN:=32768}"
 : "${ENDLESS_MAX_INPUT_TOKENS:=16384}"
@@ -51,8 +55,10 @@ COMMAND=(python "${ROOT}/train.py" \
   --population_size "${POPULATION_SIZE}" \
   --train_batch_size "${TRAIN_BATCH_SIZE}" \
   --num_iterations "${NUM_ITERATIONS}" \
-  --sigma "${SIGMA}" \
-  --alpha "${ALPHA}" \
+  --parameterization "${PARAMETERIZATION}" \
+  --lora_r "${LORA_R}" \
+  --lora_alpha "${LORA_ALPHA}" \
+  --lora_target_modules "${LORA_TARGET_MODULES}" \
   --max_tokens "${MAX_TOKENS}" \
   --max_model_len "${MAX_MODEL_LEN}" \
   --gpu_memory_utilization "${GPU_MEMORY_UTILIZATION}" \
@@ -83,6 +89,13 @@ COMMAND=(python "${ROOT}/train.py" \
   --global_seed "${GLOBAL_SEED}" \
   --center_entropy_interval "${CENTER_ENTROPY_INTERVAL}" \
   --precision bfloat16)
+
+if [[ -n "${SIGMA}" ]]; then
+  COMMAND+=(--sigma "${SIGMA}")
+fi
+if [[ -n "${ALPHA}" ]]; then
+  COMMAND+=(--alpha "${ALPHA}")
+fi
 
 if [[ -n "${WANDB_ENTITY}" ]]; then
   COMMAND+=(--wandb_entity "${WANDB_ENTITY}")

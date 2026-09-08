@@ -8,11 +8,14 @@ version = "0.1.0.dev0"
 description = "Natural bounded-staleness evolution strategies for stateful LLM agents"
 requires-python = ">=3.11"
 dependencies = [
+  "accelerate>=1,<2",
   "datasets>=3.6,<4",
   "numpy>=2.0,<3",
   "pandas>=2.2,<3",
+  "peft>=0.17,<1",
   "pyarrow>=18",
   "ray[default]>=2.48,<3",
+  "safetensors>=0.5,<1",
   "torch>=2.10",
   "transformers>=4.56,<5",
   "vllm>=0.22,<0.24",
@@ -27,6 +30,7 @@ py-modules = [
   "train",
   "async_es_coordinator",
   "distributed_utils",
+  "lora_parameterization",
   "task_adapter",
   "token_entropy_utils",
   "weight_update_utils",

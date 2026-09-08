@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import random
+import shutil
 import sys
 import time
 from typing import Any
@@ -21,10 +22,20 @@ import ray
 import torch
 from transformers import AutoTokenizer
 from vllm import SamplingParams
+from vllm.lora.request import LoRARequest
 import wandb
 
-from async_es_coordinator import BoundedStalenessCoordinator
+from async_es_coordinator import (
+    AlternatingComponentCoordinator,
+    BoundedStalenessCoordinator,
+)
 from distributed_utils import cleanup, launch_engines
+from lora_parameterization import (
+    LORA_COMPONENTS,
+    LoraPolicyState,
+    LoraSpec,
+    component_for_version,
+)
 from task_adapter import (
     BatchEvaluation,
     SamplingConfig,
@@ -69,8 +80,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--population_size", type=int, default=30)
     parser.add_argument("--num_iterations", type=int, default=100)
     parser.add_argument("--max_policy_staleness", type=int, default=1)
-    parser.add_argument("--sigma", type=float, default=0.0015)
-    parser.add_argument("--alpha", type=float, default=0.00075)
+    parser.add_argument("--sigma", type=float)
+    parser.add_argument("--alpha", type=float)
+    parser.add_argument(
+        "--parameterization",
+        choices=["full", "lora"],
+        default="full",
+        help="Optimize all model weights or a persistent alternating LoRA adapter",
+    )
+    parser.add_argument("--lora_r", type=int, default=32)
+    parser.add_argument("--lora_alpha", type=int, default=64)
+    parser.add_argument(
+        "--lora_target_modules",
+        default=(
+            "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj"
+        ),
+    )
     parser.add_argument(
         "--perturbation_scope", choices=["all", "matrix"], default="all"
     )
@@ -126,6 +151,15 @@ def parse_args() -> argparse.Namespace:
         parser.error(
             "--checkpoint_keep_iterations must contain comma-separated integers"
         )
+    args.lora_target_modules = tuple(
+        module.strip()
+        for module in args.lora_target_modules.split(",")
+        if module.strip()
+    )
+    if args.sigma is None:
+        args.sigma = 0.0075 if args.parameterization == "lora" else 0.0015
+    if args.alpha is None:
+        args.alpha = 0.005 if args.parameterization == "lora" else 0.00075
 
     positive = {
         "num_engines": args.num_engines,
@@ -147,6 +181,12 @@ def parse_args() -> argparse.Namespace:
         parser.error("--max_policy_staleness must be non-negative")
     if args.sigma <= 0.0 or args.alpha <= 0.0:
         parser.error("--sigma and --alpha must be positive")
+    if args.lora_r < 1 or args.lora_alpha < 1:
+        parser.error("--lora_r and --lora_alpha must be positive")
+    if args.parameterization == "lora" and not args.lora_target_modules:
+        parser.error("--lora_target_modules must not be empty in LoRA mode")
+    if args.parameterization == "lora" and args.perturbation_scope != "all":
+        parser.error("--perturbation_scope applies only to full parameterization")
     if not 0.0 < args.gpu_memory_utilization < 1.0:
         parser.error("--gpu_memory_utilization must be in (0, 1)")
     if bool(args.resume_checkpoint) != bool(args.start_iteration):
@@ -178,6 +218,7 @@ def generate_rollouts(
     top_p: float,
     top_k: int,
     track_token_entropy: bool,
+    lora_request: LoRARequest | None = None,
 ):
     def params(request_seed: int) -> SamplingParams:
         return SamplingParams(
@@ -192,7 +233,12 @@ def generate_rollouts(
     sampling = (
         [params(item) for item in seed] if isinstance(seed, list) else params(seed)
     )
-    return engine.generate.remote(prompts, sampling, use_tqdm=False)
+    return engine.generate.remote(
+        prompts,
+        sampling,
+        use_tqdm=False,
+        lora_request=lora_request,
+    )
 
 
 def evaluate_task_batch(
@@ -206,6 +252,7 @@ def evaluate_task_batch(
     iteration: int,
     perturbation_seed: int,
     trajectory_sample_size: int,
+    lora_request: LoRARequest | None = None,
 ) -> BatchEvaluation:
     def generate(prompts, seed, config):
         return ray.get(
@@ -218,6 +265,7 @@ def evaluate_task_batch(
                 top_p=config.top_p,
                 top_k=config.top_k,
                 track_token_entropy=config.track_token_entropy,
+                lora_request=lora_request,
             )
         )
 
@@ -267,7 +315,69 @@ def write_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
             handle.write(json.dumps(record, default=str) + "\n")
 
 
-def write_checkpoint(engines, run_dir: Path, version: int) -> Path:
+def serialize_batch_evaluation(result: BatchEvaluation) -> dict[str, Any]:
+    return {
+        "rewards": result.rewards,
+        "metrics": result.metrics,
+        "trajectories": result.trajectories,
+        "finish_reasons": result.finish_reasons,
+        "token_entropy_sum": result.token_entropy_sum,
+        "token_entropy_count": result.token_entropy_count,
+        "response_entropy_sum": result.response_entropy_sum,
+        "response_entropy_square_sum": result.response_entropy_square_sum,
+        "response_entropy_count": result.response_entropy_count,
+    }
+
+
+def deserialize_batch_evaluation(payload: dict[str, Any]) -> BatchEvaluation:
+    return BatchEvaluation(**payload)
+
+
+def serialize_pending_record(record: dict[str, Any]) -> dict[str, Any]:
+    fields = (
+        "job_id",
+        "seed",
+        "dispatch_index",
+        "dispatch_version",
+        "generation_seed",
+        "component",
+        "engine_index",
+        "catchup_seconds",
+        "perturb_seconds",
+        "rollout_seconds",
+        "total_seconds",
+        "finished_at",
+        "metrics",
+    )
+    payload = {field: record[field] for field in fields if field in record}
+    payload["evaluation"] = serialize_batch_evaluation(record["evaluation"])
+    return payload
+
+
+def deserialize_pending_record(payload: dict[str, Any]) -> dict[str, Any]:
+    record = dict(payload)
+    record["evaluation"] = deserialize_batch_evaluation(record["evaluation"])
+    return record
+
+
+def write_checkpoint(
+    engines,
+    run_dir: Path,
+    version: int,
+    *,
+    lora_state: LoraPolicyState | None = None,
+    trainer_state: dict[str, Any] | None = None,
+) -> Path:
+    if lora_state is not None:
+        path = (
+            run_dir
+            / "checkpoints"
+            / f"iteration_{version:06d}_lora_adapter"
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lora_state.save(path, trainer_state=trainer_state)
+        print(f"Checkpoint saved to {path}", flush=True)
+        return path
     path = (
         run_dir
         / "checkpoints"
@@ -286,15 +396,16 @@ def write_checkpoint(engines, run_dir: Path, version: int) -> Path:
 def prune_checkpoints(
     run_dir: Path, keep_last: int, milestones: set[int]
 ) -> None:
-    paths = sorted(
-        (run_dir / "checkpoints").glob("iteration_*_model_weights.pt")
-    )
+    paths = sorted((run_dir / "checkpoints").glob("iteration_*"))
     parsed = [(int(path.name.split("_")[1]), path) for path in paths]
     rolling = [version for version, _ in parsed if version not in milestones]
     keep = set(milestones) | set(rolling[-max(0, keep_last) :])
     for version, path in parsed:
         if version not in keep:
-            path.unlink()
+            if path.is_dir():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
             print(f"Pruned checkpoint {version}: {path}", flush=True)
 
 
@@ -329,6 +440,7 @@ def evaluate(
     run,
     run_dir: Path,
     args: argparse.Namespace,
+    lora_request: LoRARequest | None = None,
 ) -> dict[str, Any]:
     data = (
         eval_data[: args.eval_max_samples]
@@ -352,6 +464,7 @@ def evaluate(
             iteration=version,
             perturbation_seed=0,
             trajectory_sample_size=trajectory_samples_remaining,
+            lora_request=lora_request,
         )
         batches.append(result)
         trajectory_samples_remaining -= len(result.trajectories)
@@ -401,6 +514,7 @@ def probe_center_entropy(
     *,
     version: int,
     args: argparse.Namespace,
+    lora_request: LoRARequest | None = None,
 ) -> dict[str, Any]:
     shards = [
         task_data[index :: len(engines)] for index in range(len(engines))
@@ -418,6 +532,7 @@ def probe_center_entropy(
                 iteration=version,
                 perturbation_seed=0,
                 trajectory_sample_size=0,
+                lora_request=lora_request,
             )
             for index, (engine, shard) in enumerate(zip(engines, shards))
             if shard
@@ -443,22 +558,52 @@ def run_async_es(
     run,
     run_dir: Path,
     scope_stats: dict[str, Any],
+    lora_state: LoraPolicyState | None = None,
+    resume_trainer_state: dict[str, Any] | None = None,
 ) -> None:
-    coordinator = BoundedStalenessCoordinator[dict[str, Any]](
-        cohort_size=args.population_size,
-        max_staleness=args.max_policy_staleness,
-        initial_version=args.start_iteration,
-    )
+    lora_mode = lora_state is not None
+    if lora_mode and resume_trainer_state:
+        coordinator = AlternatingComponentCoordinator.from_state_dict(
+            resume_trainer_state["coordinator"],
+            deserialize_pending_record,
+        )
+        if coordinator.current_version != args.start_iteration:
+            raise ValueError(
+                "LoRA trainer state version does not match --start_iteration"
+            )
+    elif lora_mode:
+        coordinator = AlternatingComponentCoordinator[dict[str, Any]](
+            cohort_size=args.population_size,
+            max_staleness=args.max_policy_staleness,
+            components=LORA_COMPONENTS,
+            initial_version=args.start_iteration,
+        )
+    else:
+        coordinator = BoundedStalenessCoordinator[dict[str, Any]](
+            cohort_size=args.population_size,
+            max_staleness=args.max_policy_staleness,
+            initial_version=args.start_iteration,
+        )
     updates: list[dict[str, Any]] = []
     engine_versions = [args.start_iteration] * len(engines)
-    dispatch_counts: dict[int, int] = {}
+    dispatch_counts: dict[int, int] = {
+        int(version): int(count)
+        for version, count in (resume_trainer_state or {})
+        .get("dispatch_counts", {})
+        .items()
+    }
     train_batches: dict[int, list[Any]] = {}
     in_flight: dict[Any, int] = {}
-    job_counter = 0
-    completed_total = 0
-    discarded_rollout_seconds = 0.0
+    job_counter = int((resume_trainer_state or {}).get("job_counter", 0))
+    completed_total = int(
+        (resume_trainer_state or {}).get("completed_total", 0)
+    )
+    discarded_rollout_seconds = float(
+        (resume_trainer_state or {}).get("discarded_rollout_seconds", 0.0)
+    )
     run_started = time.time()
     previous_update_time = run_started
+    last_barrier_version: int | None = None
 
     def batch_for(version: int):
         if version not in train_batches:
@@ -480,27 +625,71 @@ def run_async_es(
         )
         return seed, index
 
+    def trainer_state_payload() -> dict[str, Any] | None:
+        if not lora_mode:
+            return None
+        return {
+            "parameterization": "lora",
+            "version": coordinator.current_version,
+            "coordinator": coordinator.state_dict(serialize_pending_record),
+            "dispatch_counts": {
+                str(version): count
+                for version, count in dispatch_counts.items()
+            },
+            "job_counter": job_counter,
+            "completed_total": completed_total,
+            "discarded_rollout_seconds": discarded_rollout_seconds,
+        }
+
+    def center_lora_request(
+        version: int,
+    ) -> tuple[LoRARequest | None, Path | None]:
+        if not lora_mode:
+            return None, None
+        path = (
+            run_dir
+            / ".lora_runtime"
+            / "centers"
+            / f"version_{version:06d}_{time.time_ns()}"
+        )
+        lora_state.save(path)
+        request = LoRARequest(
+            f"center-v{version}",
+            1_500_000_000 + version,
+            str(path),
+        )
+        return request, path
+
     def run_member(engine_index: int, job: dict[str, Any]):
         started = time.time()
         catchup_started = time.time()
-        apply_updates(engines[engine_index], job["pending_updates"], args)
+        if not lora_mode:
+            apply_updates(engines[engine_index], job["pending_updates"], args)
         catchup_seconds = time.time() - catchup_started
         perturb_seconds = 0.0
 
-        point = time.time()
-        ray.get(
-            engines[engine_index].collective_rpc.remote(
-                "perturb_self_weights",
-                args=(
-                    job["seed"],
-                    args.sigma,
-                    args.caching,
-                    False,
-                    args.perturbation_scope,
-                ),
+        lora_request = None
+        if lora_mode:
+            lora_request = LoRARequest(
+                f"candidate-{job['job_id']}",
+                job["job_id"] + 1,
+                job["lora_path"],
             )
-        )
-        perturb_seconds += time.time() - point
+        else:
+            point = time.time()
+            ray.get(
+                engines[engine_index].collective_rpc.remote(
+                    "perturb_self_weights",
+                    args=(
+                        job["seed"],
+                        args.sigma,
+                        args.caching,
+                        False,
+                        args.perturbation_scope,
+                    ),
+                )
+            )
+            perturb_seconds += time.time() - point
         rollout_error = None
         rollout_started = time.time()
         try:
@@ -518,26 +707,30 @@ def run_async_es(
                     if args.trajectory_interval > 0
                     else 0
                 ),
+                lora_request=lora_request,
             )
         except Exception as exc:
             rollout_error = exc
             evaluation = None
         finally:
             rollout_seconds = time.time() - rollout_started
-            point = time.time()
-            ray.get(
-                engines[engine_index].collective_rpc.remote(
-                    "restore_self_weights",
-                    args=(
-                        job["seed"],
-                        args.sigma,
-                        args.caching,
-                        False,
-                        args.perturbation_scope,
-                    ),
+            if lora_mode:
+                lora_state.remove_snapshot(job["lora_path"])
+            else:
+                point = time.time()
+                ray.get(
+                    engines[engine_index].collective_rpc.remote(
+                        "restore_self_weights",
+                        args=(
+                            job["seed"],
+                            args.sigma,
+                            args.caching,
+                            False,
+                            args.perturbation_scope,
+                        ),
+                    )
                 )
-            )
-            perturb_seconds += time.time() - point
+                perturb_seconds += time.time() - point
         if rollout_error is not None:
             raise rollout_error
         return {
@@ -555,12 +748,15 @@ def run_async_es(
         nonlocal job_counter
         version = coordinator.current_version
         seed, dispatch_index = next_perturbation_seed(version)
-        pending = [
-            update
-            for update in updates
-            if update["version"] > engine_versions[engine_index]
-        ]
+        pending = []
+        if not lora_mode:
+            pending = [
+                update
+                for update in updates
+                if update["version"] > engine_versions[engine_index]
+            ]
         job_counter += 1
+        component = component_for_version(version) if lora_mode else "full"
         job = {
             "job_id": job_counter,
             "seed": seed,
@@ -569,16 +765,35 @@ def run_async_es(
             "generation_seed": args.global_seed + version + 1,
             "task_data": batch_for(version),
             "pending_updates": pending,
+            "component": component,
         }
+        if lora_mode:
+            candidate_path = (
+                run_dir
+                / ".lora_runtime"
+                / "candidates"
+                / f"job_{job_counter:09d}"
+            )
+            lora_state.save_candidate(
+                candidate_path,
+                seed=seed,
+                sigma=args.sigma,
+                component=component,
+            )
+            job["lora_path"] = str(candidate_path)
         print(
             f"[Job {job_counter}] dispatch engine={engine_index} "
-            f"version={version} seed={seed} catchup={len(pending)}",
+            f"version={version} component={component} seed={seed} "
+            f"catchup={len(pending)}",
             flush=True,
         )
         in_flight[executor.submit(run_member, engine_index, job)] = engine_index
 
     def synchronize_engines() -> float:
         started = time.time()
+        if lora_mode:
+            engine_versions[:] = [coordinator.current_version] * len(engines)
+            return time.time() - started
         with ThreadPoolExecutor(max_workers=len(engines)) as executor:
             futures = []
             for index, version in enumerate(engine_versions):
@@ -625,60 +840,74 @@ def run_async_es(
         version: int, *, force_checkpoint: bool = False
     ) -> None:
         nonlocal previous_update_time
+        nonlocal last_barrier_version
         started = time.time()
         sync_seconds = synchronize_engines()
+        center_request, center_path = center_lora_request(version)
         checkpoint_due = force_checkpoint or (
             args.checkpoint_interval > 0
             and version % args.checkpoint_interval == 0
         )
-        if checkpoint_due:
-            write_checkpoint(engines, run_dir, version)
-            prune_checkpoints(
-                run_dir,
-                args.checkpoint_keep_last,
-                args.checkpoint_keep_iterations,
-            )
-        if (
-            args.track_token_entropy
-            and args.center_entropy_interval > 0
-            and version % args.center_entropy_interval == 0
-        ):
-            entropy = probe_center_entropy(
-                engines,
-                batch_for(max(0, version - 1)),
-                tokenizer,
-                adapter,
-                version=version,
-                args=args,
-            )
-            run.log(
-                {
-                    "train/center_policy_entropy": entropy[
-                        "avg_token_entropy"
-                    ],
-                    "train/center_response_entropy_mean": entropy[
-                        "avg_response_entropy"
-                    ],
-                    "train/center_entropy_token_count": entropy[
-                        "token_entropy_count"
-                    ],
-                },
-                step=version,
-            )
-        if args.eval_interval > 0 and (
-            version % args.eval_interval == 0
-            or version == args.num_iterations
-        ):
-            evaluate(
-                engines[0],
-                eval_data,
-                tokenizer,
-                adapter,
-                version=version,
-                run=run,
-                run_dir=run_dir,
-                args=args,
-            )
+        try:
+            if checkpoint_due:
+                write_checkpoint(
+                    engines,
+                    run_dir,
+                    version,
+                    lora_state=lora_state,
+                    trainer_state=trainer_state_payload(),
+                )
+                prune_checkpoints(
+                    run_dir,
+                    args.checkpoint_keep_last,
+                    args.checkpoint_keep_iterations,
+                )
+            if (
+                args.track_token_entropy
+                and args.center_entropy_interval > 0
+                and version % args.center_entropy_interval == 0
+            ):
+                entropy = probe_center_entropy(
+                    engines,
+                    batch_for(max(0, version - 1)),
+                    tokenizer,
+                    adapter,
+                    version=version,
+                    args=args,
+                    lora_request=center_request,
+                )
+                run.log(
+                    {
+                        "train/center_policy_entropy": entropy[
+                            "avg_token_entropy"
+                        ],
+                        "train/center_response_entropy_mean": entropy[
+                            "avg_response_entropy"
+                        ],
+                        "train/center_entropy_token_count": entropy[
+                            "token_entropy_count"
+                        ],
+                    },
+                    step=version,
+                )
+            if args.eval_interval > 0 and (
+                version % args.eval_interval == 0
+                or version == args.num_iterations
+            ):
+                evaluate(
+                    engines[0],
+                    eval_data,
+                    tokenizer,
+                    adapter,
+                    version=version,
+                    run=run,
+                    run_dir=run_dir,
+                    args=args,
+                    lora_request=center_request,
+                )
+        finally:
+            if lora_mode:
+                lora_state.remove_snapshot(center_path)
         run.log(
             {
                 "async/diagnostic_barrier_seconds": time.time() - started,
@@ -688,6 +917,7 @@ def run_async_es(
             step=version,
         )
         previous_update_time = time.time()
+        last_barrier_version = version
 
     def process(
         record: dict[str, Any], *, during_barrier: bool = False
@@ -698,19 +928,27 @@ def run_async_es(
         completed_total += 1
         metrics = record["evaluation"].to_dict()
         record["metrics"] = metrics
-        decision = coordinator.observe(
-            record, dispatch_version=record["dispatch_version"]
-        )
+        if lora_mode:
+            decision = coordinator.observe(
+                record,
+                component=record["component"],
+                dispatch_version=record["dispatch_version"],
+            )
+        else:
+            decision = coordinator.observe(
+                record, dispatch_version=record["dispatch_version"]
+            )
         if not decision.accepted:
             discarded_rollout_seconds += record["rollout_seconds"]
         print(
             f"[Job {record['job_id']}] "
-            f"{'accepted' if decision.accepted else 'discarded'}"
+            f"{'deferred' if getattr(decision, 'deferred', False) else ('accepted' if decision.accepted else 'discarded')}"
             f"{' during barrier' if during_barrier else ''}: "
             f"engine={record['engine_index']} "
             f"dispatch={decision.dispatch_version} "
             f"completion={decision.completion_version} "
             f"staleness={decision.staleness} "
+            f"component={record['component']} "
             f"reward={metrics['avg_reward']:.4f} "
             f"cohort={coordinator.cohort_fill}/{args.population_size} "
             f"rollout={record['rollout_seconds']:.1f}s",
@@ -733,9 +971,25 @@ def run_async_es(
         ).tolist()
         seeds = [item["seed"] for item in records]
         stalenesses = [item.staleness for item in cohort]
+        component = cohort[0].component if lora_mode else "full"
+        if lora_mode and any(item.component != component for item in cohort):
+            raise RuntimeError("LoRA update cohort mixed A and B perturbations")
         updates.append(
-            {"version": version, "seeds": seeds, "coeffs": coeffs}
+            {
+                "version": version,
+                "seeds": seeds,
+                "coeffs": coeffs,
+                "component": component,
+            }
         )
+        if lora_mode:
+            lora_state.apply_update(
+                seeds=seeds,
+                coefficients=coeffs,
+                alpha=args.alpha,
+                population_size=args.population_size,
+                component=component,
+            )
 
         write_json(
             run_dir
@@ -758,6 +1012,11 @@ def run_async_es(
                     "accepted_total": coordinator.accepted_total,
                     "discarded_total": coordinator.discarded_total,
                     "dispatched_total": job_counter,
+                    "parameterization": args.parameterization,
+                    "lora_component": component if lora_mode else None,
+                    "pending_component_results": (
+                        coordinator.pending_counts if lora_mode else {}
+                    ),
                     "perturbation_scope": args.perturbation_scope,
                     "active_parameters": scope_stats["active_parameters"],
                 },
@@ -803,6 +1062,11 @@ def run_async_es(
                 coordinator.accepted_total + coordinator.discarded_total,
             ),
         }
+        if lora_mode:
+            train_payload["lora/component_is_a"] = int(component == "A")
+            train_payload["lora/component_is_b"] = int(component == "B")
+            for name, count in coordinator.pending_counts.items():
+                train_payload[f"lora/pending_{name.lower()}"] = count
         task_metric_names = set().union(
             *(item["evaluation"].metrics for item in records)
         )
@@ -845,7 +1109,8 @@ def run_async_es(
         f"Natural async ES: versions {args.start_iteration}->"
         f"{args.num_iterations}, cohort={args.population_size}, "
         f"max_staleness={args.max_policy_staleness}, "
-        f"engines={len(engines)}, tasks/member={args.train_batch_size}",
+        f"engines={len(engines)}, tasks/member={args.train_batch_size}, "
+        f"parameterization={args.parameterization}",
         flush=True,
     )
     with ThreadPoolExecutor(max_workers=len(engines)) as executor:
@@ -909,13 +1174,21 @@ def run_async_es(
             )
         in_flight.clear()
 
-    diagnostic_barrier(coordinator.current_version, force_checkpoint=True)
-    final_path = run_dir / "final_model_weights.pt"
-    ray.get(
-        engines[0].collective_rpc.remote(
-            "write_weights_to_disk", args=(str(final_path),)
+    if last_barrier_version != coordinator.current_version:
+        diagnostic_barrier(coordinator.current_version, force_checkpoint=True)
+    if lora_mode:
+        final_path = run_dir / "final_lora_adapter"
+        lora_state.save(
+            final_path,
+            trainer_state=trainer_state_payload(),
         )
-    )
+    else:
+        final_path = run_dir / "final_model_weights.pt"
+        ray.get(
+            engines[0].collective_rpc.remote(
+                "write_weights_to_disk", args=(str(final_path),)
+            )
+        )
     print(
         f"Training complete: updates="
         f"{coordinator.current_version - args.start_iteration}, "
@@ -967,26 +1240,66 @@ def main() -> None:
             f"Loaded train={len(train_data)}, eval={len(eval_data)}",
             flush=True,
         )
+        lora_state = None
+        resume_trainer_state = None
+        if args.parameterization == "lora":
+            lora_spec = LoraSpec(
+                rank=args.lora_r,
+                lora_alpha=args.lora_alpha,
+                target_modules=args.lora_target_modules,
+            )
+            if args.resume_checkpoint:
+                lora_state = LoraPolicyState.load(
+                    args.resume_checkpoint,
+                    expected_spec=lora_spec,
+                )
+                trainer_state_path = (
+                    Path(args.resume_checkpoint) / "trainer_state.json"
+                )
+                if not args.eval_only and not trainer_state_path.is_file():
+                    raise ValueError(
+                        "resuming LoRA training requires trainer_state.json"
+                    )
+                if trainer_state_path.is_file():
+                    resume_trainer_state = json.loads(
+                        trainer_state_path.read_text()
+                    )
+                if lora_state.model_name != args.model_name:
+                    raise ValueError(
+                        "LoRA checkpoint base model does not match --model_name: "
+                        f"{lora_state.model_name!r} != {args.model_name!r}"
+                    )
+            else:
+                lora_state = LoraPolicyState.initialize(
+                    args.model_name,
+                    lora_spec,
+                    initialization_seed=args.global_seed,
+                )
         engines, pgs = launch_engines(
             args.num_engines,
             args.model_name,
             precision=args.precision,
             max_model_len=args.max_model_len,
             gpu_memory_utilization=args.gpu_memory_utilization,
+            enable_lora=args.parameterization == "lora",
+            max_lora_rank=args.lora_r,
         )
-        stats_result = ray.get(
-            engines[0].collective_rpc.remote(
-                "get_perturbation_scope_stats",
-                args=(args.perturbation_scope,),
+        if lora_state is not None:
+            scope_stats = lora_state.stats()
+        else:
+            stats_result = ray.get(
+                engines[0].collective_rpc.remote(
+                    "get_perturbation_scope_stats",
+                    args=(args.perturbation_scope,),
+                )
             )
-        )
-        scope_stats = (
-            stats_result[0]
-            if isinstance(stats_result, list)
-            else stats_result
-        )
+            scope_stats = (
+                stats_result[0]
+                if isinstance(stats_result, list)
+                else stats_result
+            )
         write_json(run_dir / "perturbation_scope.json", scope_stats)
-        if args.resume_checkpoint:
+        if args.resume_checkpoint and lora_state is None:
             ray.get(
                 engines[0].collective_rpc.remote(
                     "load_weights_from_disk",
@@ -1005,16 +1318,36 @@ def main() -> None:
                 f"Loaded checkpoint {args.resume_checkpoint}", flush=True
             )
         if not args.skip_initial_eval:
-            evaluate(
-                engines[0],
-                eval_data,
-                tokenizer,
-                adapter,
-                version=args.start_iteration,
-                run=run,
-                run_dir=run_dir,
-                args=args,
-            )
+            initial_request = None
+            initial_path = None
+            if lora_state is not None:
+                initial_path = (
+                    run_dir
+                    / ".lora_runtime"
+                    / "centers"
+                    / f"initial_{args.start_iteration:06d}"
+                )
+                lora_state.save(initial_path)
+                initial_request = LoRARequest(
+                    f"initial-v{args.start_iteration}",
+                    1_900_000_000 + args.start_iteration,
+                    str(initial_path),
+                )
+            try:
+                evaluate(
+                    engines[0],
+                    eval_data,
+                    tokenizer,
+                    adapter,
+                    version=args.start_iteration,
+                    run=run,
+                    run_dir=run_dir,
+                    args=args,
+                    lora_request=initial_request,
+                )
+            finally:
+                if lora_state is not None:
+                    lora_state.remove_snapshot(initial_path)
         if not args.eval_only:
             run_async_es(
                 args=args,
@@ -1026,6 +1359,8 @@ def main() -> None:
                 run=run,
                 run_dir=run_dir,
                 scope_stats=scope_stats,
+                lora_state=lora_state,
+                resume_trainer_state=resume_trainer_state,
             )
     finally:
         cleanup(engines, pgs, run)

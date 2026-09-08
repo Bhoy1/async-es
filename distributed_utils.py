@@ -54,6 +54,8 @@ def launch_engines(
     precision="bfloat16",
     max_model_len=None,
     gpu_memory_utilization=0.9,
+    enable_lora=False,
+    max_lora_rank=None,
 ):
 
     # Clean up any existing Ray state from the environment to avoid conflicts with previous runs
@@ -102,6 +104,13 @@ def launch_engines(
     }
     if max_model_len is not None:
         engine_kwargs["max_model_len"] = int(max_model_len)
+    if enable_lora:
+        engine_kwargs.update(
+            enable_lora=True,
+            max_lora_rank=int(max_lora_rank),
+            max_loras=1,
+            max_cpu_loras=2,
+        )
 
     engines = [
         ray.remote(num_cpus=0, num_gpus=0, scheduling_strategy=strategy)(ESNcclLLM).remote(
