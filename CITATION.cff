@@ -1,0 +1,24 @@
+cff-version: 1.2.0
+message: "If you use Async ES, please cite this software."
+title: "Asynchronous Is Nearly Free for Evolution Strategies on Long-Horizon Agentic Tasks"
+type: software
+authors:
+  - family-names: Hoy
+    given-names: William
+    affiliation: University of Miami
+    email: wjh58@miami.edu
+  - family-names: Fan
+    given-names: Jingxuan
+    affiliation: Harvard University
+    email: jfan@g.harvard.edu
+  - family-names: Celik
+    given-names: Nurcin
+    affiliation: University of Miami
+    email: celik@miami.edu
+  - family-names: Pan
+    given-names: Xu
+    affiliation: Harvard University
+    email: xupan@fas.harvard.edu
+repository-code: "https://github.com/Bhoy1/async-es"
+url: "https://github.com/Bhoy1/async-es"
+version: "0.1.0.dev0"
